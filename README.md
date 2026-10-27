@@ -4,6 +4,18 @@ GitHub Pages：<https://koralgrey.github.io/market-bi-dashboard/>
 
 ## 更新数据
 
+支持单独更新一个平台；未提供新源的平台保留原数据。例如仅更新天猫类目销售额：
+
+```bash
+python scripts/update_dashboard.py \
+  --tmall "/path/to/天猫_三级类目月度销售额.xlsx" \
+  --rules-db "/path/to/运营资料库.sqlite"
+```
+
+`--rules-db`只读查询当前BSM/MSR版本，不修改资料库。类目汇总表没有品牌、店铺及商品字段，不能用它更新品牌市占或验证店铺身份。页面分别显示类目与品牌样本的截止月份，历史品牌样本保留但标注待当前规则复核。`--audit-report "/path/to/audit.json"`可另存逐月汇总校验与历史修订审计；不要将本地数据库或源Excel提交到公开仓库。
+
+2026-10-27更新：天猫基础建材315类、家装主材268类，共583类，覆盖2025-01—2026-09，金额单位为元；源“宠物”页不在本建材看板范围。两个分表全部21个月已逐月与源汇总页回勾。京东、抖音保留2026-07数据；天猫品牌历史样本截至2026-06，尚未按BSM-1.14重算。
+
 1. 安装 Python 3，然后执行 `pip install -r requirements.txt`。
 2. 准备天猫、京东、抖音三份 Excel 源数据。
 3. 在仓库目录运行：

@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import sqlite3
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 
@@ -104,6 +107,25 @@ def update_tmall(data, path):
             monthly = {month: number(values[index]) for index, month in month_cols}
             rows.append({"一级类目": str(values[1]), "二级类目": str(values[2]), "三级类目": str(values[3]), "类目ID": str(values[4]), "monthly": monthly})
     months.sort()
+    if not months or not rows:
+        raise ValueError("天猫源表缺少有效类目或月份")
+    identities = [(row["一级类目"], row["类目ID"]) for row in rows]
+    if len(identities) != len(set(identities)):
+        raise ValueError("天猫源表存在重复类目ID，停止更新")
+    # Reconcile each monthly detail total to the workbook's independent summary.
+    summary = wb["汇总"]
+    header = next(summary.iter_rows(min_row=4, max_row=4, values_only=True))
+    summary_months = {str(value): index for index, value in enumerate(header) if str(value) in months}
+    summary_rows = {values[1]: values for values in summary.iter_rows(min_row=5, values_only=True)
+                    if len(values) > 1 and values[1] in ("基础建材", "家装主材")}
+    for sheet_name in ("基础建材", "家装主材"):
+        if sheet_name not in summary_rows:
+            raise ValueError(f"汇总页缺少{sheet_name}")
+        for month in months:
+            actual = sum(row["monthly"][month] for row in rows if row["一级类目"] == sheet_name)
+            expected = number(summary_rows[sheet_name][summary_months[month]])
+            if abs(actual - expected) > 0.01:
+                raise ValueError(f"{sheet_name} {month} 明细与汇总不符：{actual} != {expected}")
     l3 = []
     for row in rows:
         metrics = metric_series(row.pop("monthly"), months)
@@ -121,6 +143,39 @@ def update_tmall(data, path):
     totals = {month: sum(row["metrics"][month]["sales"] for row in l3) for month in months}
     data["months"] = months
     data["tmall"] = {"l3_data": l3, "l2_data": l2, "summary": {"category_count": len(l3), "total_sales": sum(totals.values()), "monthly_totals": totals}}
+    wb.close()
+
+
+def add_tmall_source_notice(html, data):
+    """Keep aggregate category coverage separate from historical brand samples."""
+    meta = data.get("source_metadata", {}).get("tmall", {})
+    if not meta:
+        return html
+    notice = (
+        '<div id="tmallSourceNotice" style="margin:12px 0;padding:14px 18px;'
+        'background:#fff8e6;border:1px solid #ead6a0;border-radius:8px;line-height:1.8">'
+        f'天猫类目销售额：{meta["first_month"]}—{meta["latest_month"]}，单位：元。'
+        f'品牌与雨虹市占仍为历史样本（截至{meta["brand_latest_month"]}），'
+        '尚未按当前品牌规则复核。本次源表无品牌、店铺和商品明细，未更新品牌市占。'
+        f'已核对资料库当前身份规则{meta["brand_rule_version"]}；'
+        '类目全量销售额与品牌排名采集样本为不同范围，不能混作市占分母。'
+        '</div>'
+    )
+    html = re.sub(r'<div id="tmallSourceNotice".*?</div>', '', html, flags=re.S)
+    marker = '<section id="multiTmall" class="platform-section">'
+    html = html.replace(marker, marker + '\n' + notice, 1)
+    status = (
+        f'数据截至：天猫类目 {meta["latest_month"]}；'
+        f'京东 {data["jd"]["months"][-1]}；抖音 {data["dy"]["months"][-1]}。'
+        f'天猫品牌历史样本截至 {meta["brand_latest_month"]}，待当前规则复核。'
+    )
+    html = re.sub(r'<div id="platformDataCoverage".*?</div>', '', html, flags=re.S)
+    header_end = '<span class="time">'
+    start = html.find(header_end)
+    if start >= 0:
+        end = html.find('</span>', start) + len('</span>')
+        html = html[:end] + '<div id="platformDataCoverage" style="font-size:12px;color:#64748b;margin-top:6px">' + status + '</div>' + html[end:]
+    return html
 
 
 def market_payload(records, months):
@@ -221,10 +276,12 @@ def inject_jd_selector(html):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tmall", required=True)
-    parser.add_argument("--jd", required=True)
-    parser.add_argument("--dy", required=True)
+    parser.add_argument("--tmall")
+    parser.add_argument("--jd")
+    parser.add_argument("--dy")
     parser.add_argument("--html", default="index.html")
+    parser.add_argument("--rules-db", help="只读查询资料库当前品牌及市占规则版本")
+    parser.add_argument("--audit-report", help="保存汇总校验与历史修订审计JSON")
     args = parser.parse_args()
     target = Path(args.html)
     html = target.read_text(encoding="utf-8")
@@ -232,14 +289,50 @@ def main():
     if not match:
         raise SystemExit("Embedded dashboard data was not found")
     data = json.loads(match.group(1))
-    update_tmall(data, args.tmall)
-    update_jd(data, args.jd)
-    update_dy(data, args.dy)
-    data["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    if not any((args.tmall, args.jd, args.dy)):
+        parser.error("至少提供一个平台的源文件")
+    audit = {"updated_platforms": [], "source_fields": "category-level aggregates; no brand/store/product detail"}
+    if args.tmall:
+        old = data["tmall"]["summary"]["monthly_totals"].copy()
+        update_tmall(data, args.tmall)
+        brand_months = sorted({month for item in data.get("tmall_market", {}).values() for month in item.get("months", [])})
+        rule_version, market_rule = "未查询", "未查询"
+        if args.rules_db:
+            with sqlite3.connect(Path(args.rules_db).resolve().as_uri() + "?mode=ro", uri=True) as db:
+                versions = db.execute("SELECT version_code FROM brand_store_mapping_versions WHERE status='当前有效'").fetchall()
+                if len(versions) != 1:
+                    raise ValueError("资料库必须只有一个当前品牌规则版本")
+                rule_version = versions[0][0]
+                market_rule = db.execute("SELECT current_version FROM market_share_governance").fetchone()[0]
+        meta = {"filename": Path(args.tmall).name, "sha256": hashlib.sha256(Path(args.tmall).read_bytes()).hexdigest(),
+                "first_month": data["months"][0], "latest_month": data["months"][-1], "unit": "元",
+                "sheets": ["基础建材", "家装主材"], "brand_detail_available": False,
+                "brand_latest_month": brand_months[-1] if brand_months else "无数据",
+                "brand_rule_version": rule_version, "market_rule_version": market_rule,
+                "brand_status": "历史样本未按当前身份规则重新核验；不作为最新正式品牌市占"}
+        data.setdefault("source_metadata", {})["tmall"] = meta
+        totals = data["tmall"]["summary"]["monthly_totals"]
+        audit.update({"tmall": meta, "category_count": len(data["tmall"]["l3_data"]), "monthly_totals_yuan": totals,
+                      "summary_reconciliation": "passed_all_months_both_sheets",
+                      "historical_revisions": [{"month": month, "old_yuan": value, "new_yuan": totals[month], "delta_yuan": totals[month] - value}
+                                               for month, value in old.items() if month in totals and abs(totals[month] - value) > 0.01]})
+        audit["updated_platforms"].append("tmall")
+    if args.jd:
+        update_jd(data, args.jd)
+        audit["updated_platforms"].append("jd")
+    if args.dy:
+        update_dy(data, args.dy)
+        audit["updated_platforms"].append("dy")
+    data["generated_at"] = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     html = html[:match.start(1)] + payload + html[match.end(1):]
     html = inject_jd_selector(html)
+    html = add_tmall_source_notice(html, data)
     target.write_text(html, encoding="utf-8")
+    if args.audit_report:
+        report = Path(args.audit_report)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"generated_at": data["generated_at"], "tmall_latest": data["months"][-1], "jd_latest": data["jd"]["latest_month"], "dy_latest": data["dy"]["months"][-1]}, ensure_ascii=False))
 
 
